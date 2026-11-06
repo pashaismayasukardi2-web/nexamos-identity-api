@@ -16,6 +16,7 @@ jobs:
           host: ${{ secrets.VPS_HOST || '103.190.0.23' }}
           port: ${{ secrets.VPS_PORT || 4775 }}
           username: ${{ secrets.VPS_USER || 'dsmdsm' }}
+          password: ${{ secrets.VPS_PASSWORD }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script_stop: true
           script: |
@@ -33,4 +34,3 @@ jobs:
             pm2 save
             
             echo "✅ [Sukses] Deployment nexamos-identity-api berhasil dan aktif!"
-
