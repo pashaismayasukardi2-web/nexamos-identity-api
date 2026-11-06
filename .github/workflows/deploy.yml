@@ -1,0 +1,36 @@
+name: Deploy NexaMOS Identity API to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Auto Deploy to VPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST || '103.190.0.23' }}
+          port: ${{ secrets.VPS_PORT || 4775 }}
+          username: ${{ secrets.VPS_USER || 'dsmdsm' }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          script: |
+            echo "🚀 [Deploy] Memulai auto-deploy nexamos-identity-api..."
+            cd ~/nexamos-identity-api || { echo "❌ Direktori ~/nexamos-identity-api tidak ditemukan!"; exit 1; }
+            
+            echo "📥 [Git] Menarik pembaruan kode terbaru dari branch main..."
+            git pull origin main
+            
+            echo "📦 [Dependencies] Menginstal dependensi produksi..."
+            npm install --production --prefer-offline --no-audit
+            
+            echo "🔄 [PM2] Reloading service nexamos-identity-api..."
+            pm2 reload nexamos-identity-api || pm2 restart nexamos-identity-api
+            pm2 save
+            
+            echo "✅ [Sukses] Deployment nexamos-identity-api berhasil dan aktif!"
+
