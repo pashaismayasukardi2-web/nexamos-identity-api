@@ -10,7 +10,7 @@ const { getPool } = require('../config/database');
  * Cache key selama 10 menit agar tidak spam endpoint Keycloak.
  */
 const jwks = jwksClient({
-  jwksUri: process.env.KEYCLOAK_JWKS_URI,
+  jwksUri: process.env.KEYCLOAK_JWKS_URI || 'https://nexamos.cloud/identity/realms/nexamos/protocol/openid-connect/certs',
   cache:         true,
   cacheMaxAge:   10 * 60 * 1000,
   rateLimit:     true,
@@ -55,9 +55,16 @@ async function requireOIDC(req, res, next) {
     const signingKey = await getSigningKey(decoded.header);
 
     // Verifikasi signature, expiry, issuer, audience
+    const validIssuers = [
+      process.env.KEYCLOAK_ISSUER,
+      'https://nexamos.cloud/identity/realms/nexamos',
+      'http://localhost:8180/realms/nexamos',
+      'http://127.0.0.1:8180/realms/nexamos',
+    ].filter(Boolean);
+
     const payload = jwt.verify(token, signingKey, {
       algorithms: ['RS256'],
-      issuer:     process.env.KEYCLOAK_ISSUER,
+      issuer:     validIssuers,
     });
 
     const sub = payload.sub;
@@ -121,10 +128,10 @@ async function requireOIDC(req, res, next) {
       return res.status(401).json({ status: 'error', message: 'Token expired.' });
     }
     if (err.name === 'JsonWebTokenError') {
-      return res.status(401).json({ status: 'error', message: 'Invalid token signature.' });
+      return res.status(401).json({ status: 'error', message: 'Invalid token: ' + err.message });
     }
-    console.error('[requireOIDC]', err.message);
-    res.status(500).json({ status: 'error', message: 'Authentication error.' });
+    console.error('[requireOIDC]', err);
+    res.status(500).json({ status: 'error', message: 'Authentication error: ' + err.message });
   }
 }
 

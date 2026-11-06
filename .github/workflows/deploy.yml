@@ -24,6 +24,26 @@ jobs:
             cd ~/nexamos-identity-api
             echo "📥 [Git] Menarik pembaruan kode terbaru dari branch main..."
             git pull origin main
+            
+            echo "📝 [Config] Menyiapkan konfigurasi produksi .env..."
+            cat << 'EOF' > .env
+            IAM_DB_HOST=srv1412.hstgr.io
+            IAM_DB_PORT=3306
+            IAM_DB_USER=u294320793_adminmain
+            IAM_DB_PASSWORD=Wishnunexa2026!
+            IAM_DB_NAME=u294320793_nexamain
+            PORT=4000
+            NODE_ENV=production
+            KEYCLOAK_BASE_URL=https://nexamos.cloud/identity
+            KEYCLOAK_REALM=nexamos
+            KEYCLOAK_JWKS_URI=https://nexamos.cloud/identity/realms/nexamos/protocol/openid-connect/certs
+            KEYCLOAK_ISSUER=https://nexamos.cloud/identity/realms/nexamos
+            CORS_ORIGINS=https://crm.nexamos.cloud,https://studio.nexamos.cloud,https://workspace.nexamos.cloud,https://superadmin.nexamos.cloud,https://nexamos.cloud
+            RATE_LIMIT_WINDOW_MS=900000
+            RATE_LIMIT_MAX=100
+            EOF
+            sed -i 's/^[ \t]*//' .env
+
             echo "📦 [Dependencies] Menginstal dependensi produksi..."
             npm install --production --prefer-offline --no-audit
             echo "🔄 [PM2] Reloading service nexamos-identity-api..."
