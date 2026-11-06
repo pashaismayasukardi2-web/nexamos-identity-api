@@ -21,16 +21,26 @@ jobs:
           script_stop: true
           script: |
             echo "🚀 [Deploy] Memulai auto-deploy nexamos-identity-api..."
-            cd ~/nexamos-identity-api || { echo "❌ Direktori ~/nexamos-identity-api tidak ditemukan!"; exit 1; }
-            
-            echo "📥 [Git] Menarik pembaruan kode terbaru dari branch main..."
-            git pull origin main
-            
-            echo "📦 [Dependencies] Menginstal dependensi produksi..."
-            npm install --production --prefer-offline --no-audit
-            
-            echo "🔄 [PM2] Reloading service nexamos-identity-api..."
-            pm2 reload nexamos-identity-api || pm2 restart nexamos-identity-api
-            pm2 save
-            
+            if [ ! -d ~/nexamos-identity-api ]; then
+              echo "📥 [Clone] Direktori ~/nexamos-identity-api belum ada, melakukan clone pertama kali..."
+              git clone https://github.com/pashaismayasukardi2-web/nexamos-identity-api.git ~/nexamos-identity-api
+              cd ~/nexamos-identity-api
+              if [ ! -f .env ]; then
+                cp .env.example .env
+              fi
+              echo "📦 [Dependencies] Menginstal dependensi produksi..."
+              npm install --production --prefer-offline --no-audit
+              echo "⚙️ [PM2] Mendaftarkan service nexamos-identity-api..."
+              pm2 start src/app.js --name nexamos-identity-api
+              pm2 save
+            else
+              cd ~/nexamos-identity-api
+              echo "📥 [Git] Menarik pembaruan kode terbaru dari branch main..."
+              git pull origin main
+              echo "📦 [Dependencies] Menginstal dependensi produksi..."
+              npm install --production --prefer-offline --no-audit
+              echo "🔄 [PM2] Reloading service nexamos-identity-api..."
+              pm2 reload nexamos-identity-api || pm2 restart nexamos-identity-api
+              pm2 save
+            fi
             echo "✅ [Sukses] Deployment nexamos-identity-api berhasil dan aktif!"
