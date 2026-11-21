@@ -13,6 +13,9 @@ const legacyRouter        = require('./modules/legacy/legacy.routes');
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
+// ── Trust Proxy (untuk Nginx Reverse Proxy X-Forwarded-For) ──
+app.set('trust proxy', 1);
+
 // ── CORS ─────────────────────────────────────────────────────
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
