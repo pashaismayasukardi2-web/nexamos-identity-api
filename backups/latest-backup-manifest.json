@@ -1,0 +1,21 @@
+{
+  "status": "VERIFIED",
+  "latest_archive": "iam-backup-2026-11-22T03-44-03-470Z.json.gz",
+  "size_bytes": 4032,
+  "sha256": "83f59c39e425a478ffd00740c08eb128aba88a228923cab3d3d1c6c03035f107",
+  "verified_at": "2026-11-22T03:44:04.614Z",
+  "duration_ms": 1159,
+  "row_counts": {
+    "iam_users": 9,
+    "iam_user_emails": 9,
+    "iam_organizations": 6,
+    "iam_organization_members": 8,
+    "iam_applications": 4,
+    "iam_product_entitlements": 6,
+    "iam_roles": 8,
+    "iam_permissions": 12,
+    "iam_membership_roles": 16,
+    "iam_legacy_account_links": 9,
+    "iam_audit_events": 3
+  }
+}

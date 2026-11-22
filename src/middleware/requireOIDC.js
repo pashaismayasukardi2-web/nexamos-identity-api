@@ -17,7 +17,17 @@ const jwks = jwksClient({
   jwksRequestsPerMinute: 10,
 });
 
+// Custom signing key resolver hook (used for offline unit/pen-test verification)
+let _customSigningKeyResolver = null;
+function setCustomSigningKeyResolver(fn) {
+  _customSigningKeyResolver = fn;
+}
+
 function getSigningKey(header) {
+  if (_customSigningKeyResolver) {
+    const customKey = _customSigningKeyResolver(header);
+    if (customKey) return Promise.resolve(customKey);
+  }
   return new Promise((resolve, reject) => {
     jwks.getSigningKey(header.kid, (err, key) => {
       if (err) return reject(err);
@@ -26,12 +36,63 @@ function getSigningKey(header) {
   });
 }
 
+// ── Phase 6 Performance: In-Memory TTL Cache untuk User Profile Resolution (< 200ms p99) ──
+const USER_CACHE_TTL_MS = Number(process.env.USER_CACHE_TTL_MS) || 30 * 1000; // 30 detik
+const _userCacheBySub = new Map();
+const _subByUserId = new Map();
+
+function getCachedUserBySub(sub) {
+  const entry = _userCacheBySub.get(sub);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    _userCacheBySub.delete(sub);
+    return null;
+  }
+  return entry.user;
+}
+
+function setCachedUserBySub(sub, user) {
+  if (!sub || !user) return;
+  _userCacheBySub.set(sub, {
+    user,
+    expiresAt: Date.now() + USER_CACHE_TTL_MS,
+  });
+  if (user.id) {
+    _subByUserId.set(user.id, sub);
+  }
+}
+
+function invalidateUserCache({ sub = null, userId = null } = {}) {
+  if (sub) {
+    _userCacheBySub.delete(sub);
+  }
+  if (userId) {
+    const mappedSub = _subByUserId.get(userId);
+    if (mappedSub) {
+      _userCacheBySub.delete(mappedSub);
+      _subByUserId.delete(userId);
+    }
+    for (const [k, v] of _userCacheBySub.entries()) {
+      if (v.user && v.user.id === userId) {
+        _userCacheBySub.delete(k);
+      }
+    }
+  }
+}
+
+function getUserCacheStats() {
+  return {
+    entries: _userCacheBySub.size,
+    ttl_ms: USER_CACHE_TTL_MS,
+  };
+}
+
 /**
  * Middleware: requireOIDC
  *
  * 1. Ambil Bearer token dari header Authorization.
  * 2. Verifikasi signature + expiry + issuer menggunakan JWKS Keycloak.
- * 3. Resolve Global User dari tabel iam_users (by identity_subject / 'sub').
+ * 3. Resolve Global User dari cache TTL / tabel iam_users (by identity_subject / 'sub').
  * 4. Inject req.iamUser ke request.
  *
  * Usage:
@@ -58,8 +119,10 @@ async function requireOIDC(req, res, next) {
     const validIssuers = [
       process.env.KEYCLOAK_ISSUER,
       'https://nexamos.cloud/identity/realms/nexamos',
+      'https://identity.nexamos.cloud/realms/nexamos',
       'http://localhost:8180/realms/nexamos',
       'http://127.0.0.1:8180/realms/nexamos',
+      'http://127.0.0.1:8180/identity/realms/nexamos',
     ].filter(Boolean);
 
     const payload = jwt.verify(token, signingKey, {
@@ -72,21 +135,33 @@ async function requireOIDC(req, res, next) {
       return res.status(401).json({ status: 'error', message: 'Token missing subject (sub).' });
     }
 
-    // Resolve Global User dari DB
-    const pool = getPool();
-    const [[user]] = await pool.query(
-      `SELECT u.id, u.display_name, u.status,
-              e.email, e.is_verified AS email_verified
-       FROM iam_users u
-       LEFT JOIN iam_user_emails e ON e.user_id = u.id AND e.is_primary = 1
-       WHERE u.identity_subject = ?
-       LIMIT 1`,
-      [sub]
-    );
+    // Resolve Global User dari In-Memory TTL Cache atau DB
+    let user = getCachedUserBySub(sub);
+    if (!user) {
+      const pool = getPool();
+      const [[dbUser]] = await pool.query(
+        `SELECT u.id, u.display_name, u.status, u.created_at,
+                e.id AS email_id, e.email, e.is_verified AS email_verified
+         FROM iam_users u
+         LEFT JOIN iam_user_emails e ON e.user_id = u.id AND e.is_primary = 1
+         WHERE u.identity_subject = ?
+         LIMIT 1`,
+        [sub]
+      );
+
+      if (dbUser) {
+        // Sinkronisasi klaim email_verified dari token Keycloak jika di Keycloak sudah verified
+        if (payload.email_verified === true && !dbUser.email_verified && dbUser.email_id) {
+          await pool.query('UPDATE iam_user_emails SET is_verified = 1 WHERE id = ?', [dbUser.email_id]).catch(() => {});
+          dbUser.email_verified = 1;
+        }
+        user = dbUser;
+        setCachedUserBySub(sub, user);
+      }
+    }
 
     if (!user) {
       // User belum pernah login via Identity API — perlu provisioning
-      // Ini terjadi pada user baru yang baru saja register di Keycloak
       return res.status(403).json({
         status: 'error',
         code:   'USER_NOT_PROVISIONED',
@@ -94,7 +169,16 @@ async function requireOIDC(req, res, next) {
       });
     }
 
+    // AT-015 Compliance: Suspended user denied + audit log
     if (user.status === 'suspended') {
+      await auditLog({
+        eventType:  'SUSPENDED_USER_ACCESS_DENIED',
+        actorId:    user.id,
+        targetType: 'user',
+        targetId:   user.id,
+        payload:    { path: req.originalUrl, method: req.method, sub },
+        req,
+      });
       return res.status(403).json({
         status: 'error',
         code:   'USER_SUSPENDED',
@@ -110,13 +194,16 @@ async function requireOIDC(req, res, next) {
       });
     }
 
+    const isEmailVerified = Boolean(user.email_verified || payload.email_verified === true);
+
     // Inject ke request
     req.iamUser = {
       id:             user.id,
       display_name:   user.display_name,
-      email:          user.email  || null,
-      email_verified: !!user.email_verified,
+      email:          user.email  || payload.email || null,
+      email_verified: isEmailVerified,
       status:         user.status,
+      created_at:     user.created_at,
       sub,
       // Forward claim Keycloak yang berguna
       kcRoles:        payload.realm_access?.roles || [],
@@ -136,11 +223,95 @@ async function requireOIDC(req, res, next) {
 }
 
 /**
+ * requireVerifiedEmail — middleware tambahan setelah requireOIDC (AT-013 Compliance).
+ * Mencegah user dengan email yang belum diverifikasi melakukan operasi sensitif
+ * (seperti membuat organisasi B2B baru atau mengundang anggota eksternal).
+ */
+async function requireVerifiedEmail(req, res, next) {
+  if (!req.iamUser?.email_verified) {
+    await auditLog({
+      eventType:  'UNVERIFIED_EMAIL_RESTRICTED',
+      actorId:    req.iamUser?.id || null,
+      targetType: 'user',
+      targetId:   req.iamUser?.id || null,
+      payload:    { path: req.originalUrl, method: req.method, email: req.iamUser?.email },
+      req,
+    });
+    return res.status(403).json({
+      status:  'error',
+      code:    'EMAIL_NOT_VERIFIED',
+      message: 'Alamat email Anda belum diverifikasi. Silakan verifikasi email terlebih dahulu untuk mengakses fitur ini.',
+    });
+  }
+  next();
+}
+
+/**
+ * requireInternalOrOIDC — proteksi endpoint internal (/users/provision, /legacy/link)
+ * Menerima header X-Internal-Api-Key, request dari loopback (127.0.0.1 / ::1), atau Bearer token OIDC yang valid.
+ */
+async function requireInternalOrOIDC(req, res, next) {
+  const internalKey = process.env.INTERNAL_API_KEY;
+  const providedKey = req.headers['x-internal-api-key'];
+  if (internalKey && providedKey && providedKey === internalKey) {
+    return next();
+  }
+
+  const remoteIp = req.ip || req.socket?.remoteAddress || '';
+  const isLoopback =
+    remoteIp === '127.0.0.1' ||
+    remoteIp === '::1' ||
+    remoteIp === '::ffff:127.0.0.1';
+
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    try {
+      const token = authHeader.slice(7);
+      const decoded = jwt.decode(token, { complete: true });
+      if (decoded && decoded.header?.kid) {
+        const signingKey = await getSigningKey(decoded.header);
+        const validIssuers = [
+          process.env.KEYCLOAK_ISSUER,
+          'https://nexamos.cloud/identity/realms/nexamos',
+          'https://identity.nexamos.cloud/realms/nexamos',
+          'http://localhost:8180/realms/nexamos',
+          'http://127.0.0.1:8180/realms/nexamos',
+          'http://127.0.0.1:8180/identity/realms/nexamos',
+        ].filter(Boolean);
+        req.oidcPayload = jwt.verify(token, signingKey, {
+          algorithms: ['RS256'],
+          issuer: validIssuers,
+        });
+        return next();
+      }
+    } catch (_) {}
+  }
+
+  if (isLoopback) {
+    return next();
+  }
+
+  await auditLog({
+    eventType:  'UNAUTHORIZED_INTERNAL_ENDPOINT_ACCESS',
+    targetType: 'endpoint',
+    targetId:   req.originalUrl,
+    payload:    { ip: remoteIp, method: req.method },
+    req,
+  });
+
+  return res.status(401).json({
+    status:  'error',
+    code:    'INTERNAL_AUTH_REQUIRED',
+    message: 'Internal service authentication required.',
+  });
+}
+
+/**
  * requireSuperadmin — middleware tambahan setelah requireOIDC.
  * Hanya lolos jika user memiliki role SUPERADMIN di Keycloak realm.
  */
 function requireSuperadmin(req, res, next) {
-  const roles = req.iamUser?.kcRoles || [];
+  const roles = (req.iamUser?.kcRoles || []).map(r => String(r).toLowerCase());
   if (!roles.includes('superadmin')) {
     return res.status(403).json({
       status: 'error',
@@ -176,5 +347,15 @@ async function auditLog({ eventType, actorId = null, targetType = null, targetId
   }
 }
 
-module.exports = { requireOIDC, requireSuperadmin, auditLog };
+module.exports = {
+  requireOIDC,
+  requireVerifiedEmail,
+  requireInternalOrOIDC,
+  requireSuperadmin,
+  auditLog,
+  invalidateUserCache,
+  getUserCacheStats,
+  setCustomSigningKeyResolver,
+};
+
 

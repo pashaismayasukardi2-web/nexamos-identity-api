@@ -4,5 +4,7 @@ node_modules/
 *.jar
 *.tar.gz
 .DS_Store
+backups/*.json.gz
+
 
 

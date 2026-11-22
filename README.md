@@ -182,19 +182,57 @@ Base URL: `https://identity.nexamos.cloud/api/v1`
 
 ---
 
+## 🛡️ Phase 6 — Disaster Recovery, Backup & Monitoring Runbook
+
+### 1. Automated IAM Database Backup & Restore Verification
+Seluruh 11 tabel IAM (`iam_*`) di `u294320793_nexamain` di-backup secara otomatis ke format JSON terkompresi (`.json.gz`) dengan verifikasi checksum SHA-256 dan uji integritas restore otomatis:
+
+```bash
+# Jalankan backup & uji restore secara manual atau via cron harian:
+node scripts/backup-iam-db.js
+
+# Cron harian (setiap pukul 02:00 WIB di VPS):
+0 19 * * * cd /home/dsmdsm/nexamos-identity-api && /usr/bin/node scripts/backup-iam-db.js >> /var/log/nexamos-iam-backup.log 2>&1
+```
+- **Lokasi Arsip:** `nexamos-identity-api/backups/iam-backup-<timestamp>.json.gz`
+- **Manifest Verifikasi:** `nexamos-identity-api/backups/latest-backup-manifest.json`
+- **Retensi Otomatis:** Menyimpan 14 snapshot harian terakhir.
+
+### 2. Prosedur Disaster Recovery (DR)
+1. **Skenario A — Kegagalan Service Identity API / Keycloak di VPS (`103.190.0.23`):**
+   - Jalankan skrip self-healing & monitoring:
+     ```bash
+     bash scripts/monitor-iam-health.sh
+     ```
+   - Skrip memeriksa `http://127.0.0.1:8180/identity/realms/nexamos` dan `http://127.0.0.1:4000/health`. Jika salah satu layanan mati, skrip otomatis menjalankan `systemctl restart keycloak.service` atau `pm2 restart nexamos-identity-api`.
+2. **Skenario B — Pemulihan Skema & Data IAM Database (`u294320793_nexamain`):**
+   - Jalankan migrasi dasar & seed master:
+     ```bash
+     node db/migrate.js --seed
+     ```
+   - Ekstrak snapshot terbaru dari `backups/iam-backup-*.json.gz` untuk memulihkan baris `iam_users`, `iam_user_emails`, `iam_organizations`, `iam_organization_members`, `iam_product_entitlements`, dan `iam_legacy_account_links`.
+3. **Skenario C — Aktivasi / Pemulihan Kebijakan MFA TOTP & Brute-Force Keycloak:**
+   - Jalankan skrip otomasi Admin REST API Keycloak:
+     ```bash
+     bash scripts/enable-keycloak-mfa.sh
+     ```
+
+### 3. Security, Acceptance & Load Testing Suite (< 200ms p99)
+Untuk memverifikasi seluruh kriteria keamanan Phase 6 (`AT-011`, `AT-013`, `AT-015`, CORS allowlist, JWT forgery protection, dan p99 latency `< 200ms`):
+
+```bash
+node tests/phase6-hardening-suite.js
+```
+
+---
+
 ## Status Phase
 
 - [x] **Phase 0** — Technical Discovery ✅
 - [x] **Phase 1** — Identity Foundation ✅
-  - [x] MySQL IAM Schema (11 tabel)
-  - [x] Seed data (4 apps, 8 roles, 12 permissions)
-  - [x] Identity API (users, organizations, entitlements, legacy)
-  - [ ] Deploy Keycloak ke VPS (manual step — lihat setup-keycloak.sh)
-  - [ ] Nginx + SSL setup (manual step — lihat nginx-identity.conf)
-  - [ ] PM2 deploy
-- [ ] **Phase 2** — Web Studio Integration
-- [ ] **Phase 3** — Unified Workspace
-- [ ] **Phase 4** — CRM Integration
-- [ ] **Phase 5** — Corporate Website
-- [ ] **Phase 6** — Hardening
+- [x] **Phase 2** — Web Studio Integration ✅
+- [x] **Phase 3** — Unified Workspace ✅
+- [x] **Phase 4** — CRM Integration ✅
+- [x] **Phase 5** — Corporate Website ✅
+- [x] **Phase 6** — Hardening, Security, Backup & Performance ✅
 

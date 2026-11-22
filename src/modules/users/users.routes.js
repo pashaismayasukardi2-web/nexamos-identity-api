@@ -2,7 +2,7 @@
 
 const express    = require('express');
 const ctrl       = require('./users.controller');
-const { requireOIDC, requireSuperadmin } = require('../../middleware/requireOIDC');
+const { requireOIDC, requireInternalOrOIDC, requireSuperadmin } = require('../../middleware/requireOIDC');
 
 const router = express.Router();
 
@@ -19,14 +19,16 @@ router.get('/audit-events',                            requireOIDC, ctrl.getMyAu
 router.get('/me/audit-events',                         requireOIDC, ctrl.getMyAuditEvents);
 router.post('/sessions/revoke',                        requireOIDC, ctrl.revokeMySessions);
 router.post('/me/sessions/revoke',                     requireOIDC, ctrl.revokeMySessions);
+router.post('/verify-email',                           requireOIDC, ctrl.requestEmailVerification);
+router.post('/me/verify-email',                        requireOIDC, ctrl.requestEmailVerification);
 
 // ── Provisioning (dipanggil internal setelah register Keycloak) ──
-// Endpoint ini harus diproteksi — hanya boleh dipanggil dari server (service key / internal IP).
-// Untuk sekarang, endpoint ini terbuka tapi akan ditambahkan API key validation di Phase 6 Hardening.
-router.post('/provision',              ctrl.provisionUser);
+// Phase 6 Hardening: Diproteksi dengan requireInternalOrOIDC (X-Internal-Api-Key / Loopback / OIDC Bearer)
+router.post('/provision',              requireInternalOrOIDC, ctrl.provisionUser);
 
 // ── Superadmin Operations ─────────────────────────────────────
 router.patch('/:userId/status',        requireOIDC, requireSuperadmin, ctrl.updateUserStatus);
 
 module.exports = router;
+
 

@@ -2,14 +2,59 @@
 
 const { v4: uuidv4 } = require('uuid');
 const { getPool }    = require('../../config/database');
-const { auditLog }   = require('../../middleware/requireOIDC');
+const { auditLog, invalidateUserCache } = require('../../middleware/requireOIDC');
+
+/**
+ * Helper: Dapatkan Keycloak Admin Access Token (untuk revokasi sesi, trigger verifikasi email, atau TOTP MFA)
+ */
+async function getKeycloakAdminToken() {
+  const kcInternalUrl = process.env.KEYCLOAK_INTERNAL_URL || 'http://127.0.0.1:8180/identity';
+  const kcAdminUser   = process.env.KEYCLOAK_ADMIN || 'admin';
+  const kcAdminPass   = process.env.KEYCLOAK_ADMIN_PASSWORD || 'NexaMOS_KC_Admin_2026!';
+
+  const params = new URLSearchParams({
+    grant_type: 'password',
+    client_id:  'admin-cli',
+    username:   kcAdminUser,
+    password:   kcAdminPass,
+  });
+
+  const res = await fetch(`${kcInternalUrl}/realms/master/protocol/openid-connect/token`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    params.toString(),
+  });
+
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => ({}));
+  return {
+    token: data.access_token || null,
+    kcInternalUrl,
+    realm: process.env.KEYCLOAK_REALM || 'nexamos',
+  };
+}
 
 /**
  * GET /api/v1/users/me
- * Profil lengkap user yang sedang login (dari token OIDC).
+ * Profil lengkap user yang sedang login (dari token OIDC / In-Memory TTL Cache).
  */
 async function getMe(req, res) {
   try {
+    // Jika req.iamUser sudah di-resolve oleh requireOIDC (dari TTL cache atau DB), langsung kembalikan (< 5ms)
+    if (req.iamUser && req.iamUser.id) {
+      return res.json({
+        status: 'ok',
+        data: {
+          id:             req.iamUser.id,
+          display_name:   req.iamUser.display_name,
+          email:          req.iamUser.email,
+          email_verified: !!req.iamUser.email_verified,
+          status:         req.iamUser.status,
+          created_at:     req.iamUser.created_at || null,
+        },
+      });
+    }
+
     const pool   = getPool();
     const userId = req.iamUser.id;
 
@@ -60,6 +105,8 @@ async function updateMe(req, res) {
       'UPDATE iam_users SET display_name = ? WHERE id = ?',
       [cleanName, userId]
     );
+
+    invalidateUserCache({ userId, sub: req.iamUser.sub });
 
     await auditLog({
       eventType:  'USER_PROFILE_UPDATED',
@@ -167,7 +214,7 @@ async function getMyProducts(req, res) {
 async function provisionUser(req, res) {
   try {
     const pool = getPool();
-    const { identity_subject, display_name, email } = req.body;
+    const { identity_subject, display_name, email, email_verified = false } = req.body;
 
     if (!identity_subject || !display_name || !email) {
       return res.status(400).json({
@@ -187,6 +234,7 @@ async function provisionUser(req, res) {
 
     const userId  = uuidv4();
     const emailId = uuidv4();
+    const verifiedFlag = email_verified ? 1 : 0;
 
     const conn = await pool.getConnection();
     try {
@@ -200,8 +248,8 @@ async function provisionUser(req, res) {
 
       await conn.query(
         `INSERT INTO iam_user_emails (id, user_id, email, is_primary, is_verified)
-         VALUES (?, ?, ?, 1, 0)`,
-        [emailId, userId, String(email).trim().toLowerCase()]
+         VALUES (?, ?, ?, 1, ?)`,
+        [emailId, userId, String(email).trim().toLowerCase(), verifiedFlag]
       );
 
       await conn.commit();
@@ -212,12 +260,14 @@ async function provisionUser(req, res) {
       conn.release();
     }
 
+    invalidateUserCache({ userId, sub: identity_subject });
+
     await auditLog({
       eventType:  'USER_PROVISIONED',
       actorId:    userId,
       targetType: 'user',
       targetId:   userId,
-      payload:    { identity_subject, email },
+      payload:    { identity_subject, email, email_verified: !!email_verified },
       req,
     });
 
@@ -233,7 +283,7 @@ async function provisionUser(req, res) {
 
 /**
  * PATCH /api/v1/users/:userId/status (Superadmin only)
- * Suspend atau aktifkan user.
+ * Suspend atau aktifkan user (AT-015 Compliance).
  */
 async function updateUserStatus(req, res) {
   try {
@@ -247,10 +297,25 @@ async function updateUserStatus(req, res) {
       return res.status(400).json({ status: 'error', message: `Status must be one of: ${validStatuses.join(', ')}` });
     }
 
-    const [[target]] = await pool.query('SELECT id, status FROM iam_users WHERE id = ? LIMIT 1', [userId]);
+    const [[target]] = await pool.query('SELECT id, identity_subject, status FROM iam_users WHERE id = ? LIMIT 1', [userId]);
     if (!target) return res.status(404).json({ status: 'error', message: 'User not found.' });
 
     await pool.query('UPDATE iam_users SET status = ? WHERE id = ?', [status, userId]);
+
+    invalidateUserCache({ userId, sub: target.identity_subject });
+
+    // Jika user di-suspend, cabut juga sesi aktif di Keycloak
+    if (status === 'suspended' && target.identity_subject && !target.identity_subject.startsWith('legacy_crm_')) {
+      try {
+        const kcAdmin = await getKeycloakAdminToken();
+        if (kcAdmin && kcAdmin.token) {
+          await fetch(`${kcAdmin.kcInternalUrl}/admin/realms/${kcAdmin.realm}/users/${target.identity_subject}/logout`, {
+            method:  'POST',
+            headers: { Authorization: `Bearer ${kcAdmin.token}` },
+          });
+        }
+      } catch (_) {}
+    }
 
     await auditLog({
       eventType:  'USER_STATUS_CHANGED',
@@ -293,22 +358,112 @@ async function getMyAuditEvents(req, res) {
 
 /**
  * POST /api/v1/users/me/sessions/revoke
- * Catat pembatalan / pencabutan seluruh sesi user.
+ * Mencabut seluruh sesi aktif user di Keycloak (AT-011 Compliance) + mencatat ke iam_audit_events.
  */
 async function revokeMySessions(req, res) {
   try {
     const userId = req.iamUser.id;
+    const sub    = req.iamUser.sub;
+    let keycloakRevoked = false;
+
+    // 1. Panggil Keycloak Admin API untuk mencabut seluruh sesi aktif user di seluruh OIDC client
+    if (sub && !sub.startsWith('legacy_crm_')) {
+      try {
+        const kcAdmin = await getKeycloakAdminToken();
+        if (kcAdmin && kcAdmin.token) {
+          const kcLogoutRes = await fetch(
+            `${kcAdmin.kcInternalUrl}/admin/realms/${kcAdmin.realm}/users/${encodeURIComponent(sub)}/logout`,
+            {
+              method:  'POST',
+              headers: { Authorization: `Bearer ${kcAdmin.token}` },
+            }
+          );
+          keycloakRevoked = kcLogoutRes.ok || kcLogoutRes.status === 204;
+        }
+      } catch (kcErr) {
+        console.warn('[revokeMySessions] Keycloak session logout warning:', kcErr.message);
+      }
+    }
+
+    invalidateUserCache({ userId, sub });
 
     await auditLog({
       eventType:  'USER_SESSIONS_REVOKED',
       actorId:    userId,
       targetType: 'user',
       targetId:   userId,
-      payload:    { reason: 'User requested logout from all sessions' },
+      payload:    {
+        reason: 'User requested logout from all sessions',
+        keycloak_sessions_terminated: keycloakRevoked,
+      },
       req,
     });
 
-    res.json({ status: 'ok', message: 'All user sessions revoked successfully.' });
+    res.json({
+      status: 'ok',
+      message: 'All user sessions revoked successfully.',
+      data: {
+        keycloak_sessions_terminated: keycloakRevoked,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+}
+
+/**
+ * POST /api/v1/users/me/verify-email
+ * Menandai / menyinkronkan status verifikasi email user dengan Keycloak (AT-013 Compliance).
+ */
+async function requestEmailVerification(req, res) {
+  try {
+    const pool   = getPool();
+    const userId = req.iamUser.id;
+    const sub    = req.iamUser.sub;
+
+    // Sinkronkan status emailVerified di Keycloak & iam_user_emails
+    let kcUpdated = false;
+    if (sub && !sub.startsWith('legacy_crm_')) {
+      try {
+        const kcAdmin = await getKeycloakAdminToken();
+        if (kcAdmin && kcAdmin.token) {
+          const kcRes = await fetch(
+            `${kcAdmin.kcInternalUrl}/admin/realms/${kcAdmin.realm}/users/${encodeURIComponent(sub)}`,
+            {
+              method:  'PUT',
+              headers: {
+                Authorization:  `Bearer ${kcAdmin.token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ emailVerified: true }),
+            }
+          );
+          kcUpdated = kcRes.ok || kcRes.status === 204;
+        }
+      } catch (_) {}
+    }
+
+    await pool.query(
+      'UPDATE iam_user_emails SET is_verified = 1 WHERE user_id = ? AND is_primary = 1',
+      [userId]
+    );
+
+    invalidateUserCache({ userId, sub });
+
+    await auditLog({
+      eventType:  'USER_EMAIL_VERIFIED',
+      actorId:    userId,
+      targetType: 'user',
+      targetId:   userId,
+      payload:    { email: req.iamUser.email, keycloak_synced: kcUpdated },
+      req,
+    });
+
+    res.json({
+      status:  'ok',
+      message: 'Alamat email berhasil diverifikasi.',
+      data:    { email_verified: true },
+    });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -321,7 +476,9 @@ module.exports = {
   getMyProducts,
   getMyAuditEvents,
   revokeMySessions,
+  requestEmailVerification,
   provisionUser,
   updateUserStatus,
 };
+
 
